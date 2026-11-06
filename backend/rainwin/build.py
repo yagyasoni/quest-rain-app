@@ -13,6 +13,8 @@ Output layout (under DATA_DIR):
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import logging
 import shutil
@@ -44,10 +46,43 @@ def _retry(fn, *args, attempts: int = 4, **kwargs):
             time.sleep(wait)
 
 
+@contextlib.contextmanager
+def build_lock(data_dir: Path):
+    """Exclusive, non-blocking lock so only one build runs per data directory.
+
+    Yields True if this process holds the lock, False if another build is
+    already running (several API workers or a manual run at the same time).
+    The OS releases the lock if the process dies, so it can never go stale.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    with open(data_dir / ".build.lock", "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def build(source: str = "ecmwf", max_step: int = config.MAX_STEP, workers: int = 4,
           data_dir: Path = config.DATA_DIR, run: datetime | None = None,
-          force: bool = False) -> Path:
-    data_dir.mkdir(parents=True, exist_ok=True)
+          force: bool = False) -> Path | None:
+    """Build the products for ``run`` (default: freshest complete run).
+
+    Returns the run directory, or None if another build already holds the lock.
+    """
+    with build_lock(data_dir) as acquired:
+        if not acquired:
+            log.info("another build is already running in %s; skipping", data_dir)
+            return None
+        return _build_locked(source, max_step, workers, data_dir, run, force)
+
+
+def _build_locked(source: str, max_step: int, workers: int, data_dir: Path,
+                  run: datetime | None, force: bool) -> Path:
     run = run or latest_complete_run(source, max_step)
     run_id = run.strftime("%Y%m%d%H")
     final = data_dir / "runs" / run_id
